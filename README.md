@@ -8,6 +8,12 @@ Dieses Paket enthaelt ein Databricks-Notebook im Source-Format zur parallelen Au
   Databricks Notebook Source. Fuehrt die komplette Pipeline aus:
   PDF-Fund, Orientierungserkennung, Vision-Extraktion, Re-Run-Konsolidierung und Excel-Export pro Dokument.
 
+- `03_materialzeugnis_xlsx_export.py`  
+  Excel-Export (.xlsx) pro Dokument, dokumentweit ueber alle Laeufe. Zwei getrennte
+  Ablagestrukturen: `mit_run_info/<ordnernummer>/<stem>.xlsx` (alle Felder inkl.
+  Modellname/Run-IDs) und `ohne_run_info/<ordnernummer>/<stem>.xlsx` (nur fachliche
+  Felder). Der Ordnername ist die Nummer des Herkunftsordners unter `Projektdaten/`.
+
 - `GENIE_PROMPT.md`  
   Korrigierter Prompt fuer Databricks Genie / Databricks Assistant. Ziel ist nicht Q&A, sondern die Erzeugung eines Export-Notebooks.
 
