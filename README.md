@@ -14,6 +14,13 @@ Dieses Paket enthaelt ein Databricks-Notebook im Source-Format zur parallelen Au
   Modellname/Run-IDs) und `ohne_run_info/<ordnernummer>/<stem>.xlsx` (nur fachliche
   Felder). Der Ordnername ist die Nummer des Herkunftsordners unter `Projektdaten/`.
 
+- `04_materialzeugnis_reflatten.py`  
+  Berechnet `identifiers` und `datapoints_runs` aus dem vorhandenen
+  `parsed_json` aller Laeufe neu (mit korrigierter Confidence-Logik) und baut
+  `datapoints` neu auf. Keine Modell-Calls. Damit lassen sich bereits erfasste
+  Daten korrigieren, ohne erneut zu extrahieren. Quelle der Wahrheit ist
+  `materialzeugnisse_raw_page_extractions.parsed_json` (wird nur gelesen).
+
 - `GENIE_PROMPT.md`  
   Korrigierter Prompt fuer Databricks Genie / Databricks Assistant. Ziel ist nicht Q&A, sondern die Erzeugung eines Export-Notebooks.
 
