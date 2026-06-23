@@ -12,7 +12,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install json-repair --quiet
+# MAGIC %pip install json-repair pymupdf --quiet
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -38,6 +38,11 @@ import pandas as pd
 import requests
 from json_repair import repair_json
 from PIL import Image, ImageDraw
+try:
+    import fitz  # PyMuPDF, nur als Fallback um fehlende Seitenbilder zu rendern
+    _HAS_FITZ = True
+except Exception:
+    _HAS_FITZ = False
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
@@ -58,6 +63,16 @@ SCHEMA = "u_daniel_bick"
 
 PRIMARY_MODEL = "databricks-claude-opus-4-8"
 FALLBACK_MODEL = "databricks-claude-sonnet-4-6"
+
+# Wenn gesetzt (Widget FORCE_MODEL), wird AUSSCHLIESSLICH dieses Modell genutzt -
+# kein automatischer Fallback. Damit laesst sich z.B. Opus erzwingen, auch wenn
+# der initiale Verfuegbarkeits-Test einmal flaky war.
+DEFAULT_FORCE_MODEL = ""
+
+# Fehlende Seitenbilder im Volume bei Bedarf aus dem PDF rendern (statt Fehler).
+DEFAULT_RENDER_MISSING_IMAGES = True
+RENDER_DPI = 200          # Render-Aufloesung fuer on-demand erzeugte Seiten
+PERSIST_RENDERED_IMAGES = True  # gerenderte Seiten als PNG ins Volume schreiben
 
 EXPECTED_PDF_COUNT = 53
 
@@ -113,6 +128,8 @@ EXTRACTION_PROMPT_VERSION = "materialzeugnis_v4_compact_complete_extraction"
 # Optional: Widgets erlauben Job-Parameter.
 RUN_MODE = DEFAULT_RUN_MODE
 SOURCE_RUN_ID = ""
+FORCE_MODEL = DEFAULT_FORCE_MODEL
+RENDER_MISSING_IMAGES = DEFAULT_RENDER_MISSING_IMAGES
 try:
     dbutils.widgets.text("ROOT_PATH", DEFAULT_ROOT_PATH)
     dbutils.widgets.text("EXPORT_ROOT_PATH", DEFAULT_EXPORT_ROOT_PATH)
@@ -124,6 +141,10 @@ try:
     dbutils.widgets.text("RUN_ID", "")
     dbutils.widgets.dropdown("RUN_MODE", DEFAULT_RUN_MODE, list(VALID_RUN_MODES))
     dbutils.widgets.text("SOURCE_RUN_ID", "")
+    dbutils.widgets.dropdown(
+        "FORCE_MODEL", "", ["", PRIMARY_MODEL, FALLBACK_MODEL]
+    )
+    dbutils.widgets.dropdown("RENDER_MISSING_IMAGES", "true", ["true", "false"])
     dbutils.widgets.text("DOCUMENT_FILTER", "")
     ROOT_PATH = dbutils.widgets.get("ROOT_PATH").strip() or DEFAULT_ROOT_PATH
     EXPORT_ROOT_PATH = dbutils.widgets.get("EXPORT_ROOT_PATH").strip() or DEFAULT_EXPORT_ROOT_PATH
@@ -133,6 +154,8 @@ try:
         RUN_ID = RUN_ID_WIDGET
     RUN_MODE = (dbutils.widgets.get("RUN_MODE").strip() or DEFAULT_RUN_MODE).lower()
     SOURCE_RUN_ID = dbutils.widgets.get("SOURCE_RUN_ID").strip()
+    FORCE_MODEL = dbutils.widgets.get("FORCE_MODEL").strip()
+    RENDER_MISSING_IMAGES = dbutils.widgets.get("RENDER_MISSING_IMAGES").strip().lower() != "false"
     DOCUMENT_FILTER = dbutils.widgets.get("DOCUMENT_FILTER").strip()
 except Exception:
     ROOT_PATH = DEFAULT_ROOT_PATH
@@ -147,6 +170,8 @@ if RUN_MODE not in VALID_RUN_MODES:
 print(f"RUN_ID: {RUN_ID}")
 print(f"RUN_MODE: {RUN_MODE}")
 print(f"SOURCE_RUN_ID: {SOURCE_RUN_ID or '(auto: letzter Lauf)'}")
+print(f"FORCE_MODEL: {FORCE_MODEL or '(aus: Opus zuerst, dann Fallback)'}")
+print(f"RENDER_MISSING_IMAGES: {RENDER_MISSING_IMAGES}")
 print(f"ROOT_PATH: {ROOT_PATH}")
 print(f"EXPORT_ROOT_PATH: {EXPORT_ROOT_PATH}")
 print(f"IMAGES_ROOT_PATH: {IMAGES_ROOT_PATH}")
@@ -545,19 +570,82 @@ def resolve_image_path(pdf_path: str, page_number: int) -> str:
     return str(Path(IMAGES_ROOT_PATH) / ordner / stem / image_name)
 
 
+def _downscale_to_jpeg(img: "Image.Image", max_side: int = MAX_IMAGE_SIDE_PX, quality: int = JPEG_QUALITY) -> Tuple[bytes, Tuple[int, int]]:
+    """Skaliert ein PIL-Bild auf max. Kantenlaenge herunter und gibt JPEG-Bytes zurueck.
+
+    Begrenzt Payload-Groesse (vermeidet 400 'image too large') und Speicherbedarf.
+    Vision-Modelle rechnen ohnehin auf ca. 1568 px lange Kante herunter.
+    """
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    if max(img.size) > max_side:
+        img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=quality, optimize=True)
+    return out.getvalue(), img.size
+
+
+def _render_pdf_page_image(pdf_path: str, page_number: int) -> "Image.Image":
+    """Rendert eine einzelne PDF-Seite (1-basiert) als PIL-Bild via PyMuPDF."""
+    if not _HAS_FITZ:
+        raise RuntimeError("PyMuPDF (fitz) nicht verfuegbar - kann fehlendes Bild nicht rendern.")
+    doc = fitz.open(pdf_path)
+    try:
+        if page_number < 1 or page_number > doc.page_count:
+            raise IndexError(f"Seite {page_number} ausserhalb 1..{doc.page_count} in {pdf_path}")
+        page = doc.load_page(page_number - 1)
+        zoom = RENDER_DPI / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    finally:
+        doc.close()
+
+
+def _persist_rendered_png(img: "Image.Image", pdf_path: str, page_number: int) -> None:
+    """Schreibt ein gerendertes Seitenbild als PNG an den erwarteten Volume-Pfad,
+    damit Folgelaeufe es als Cache wiederfinden. Best-effort.
+    """
+    if not PERSIST_RENDERED_IMAGES:
+        return
+    target = resolve_image_path(pdf_path, page_number)
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        img.save(target, format="PNG")
+    except Exception as exc:
+        print(f"  Hinweis: gerendertes Bild konnte nicht gespeichert werden ({target}): {repr(exc)}")
+
+
 def load_page_image_bytes(pdf_path: str, page_number: int) -> Tuple[bytes, Tuple[int, int], float]:
-    """Laedt ein vorgerendertes Seitenbild aus dem Volume.
-    Returns: (image_bytes, (width, height), size_mb)
+    """Liefert ein modelltaugliches Seitenbild als (jpeg_bytes, (w, h), size_mb).
+
+    1. Vorgerendertes PNG aus dem Volume laden, falls vorhanden.
+    2. Sonst - falls RENDER_MISSING_IMAGES - die Seite aus dem PDF rendern und das
+       PNG ins Volume schreiben (Cache fuer Folgelaeufe).
+    Das Bild wird immer auf MAX_IMAGE_SIDE_PX herunterskaliert und als JPEG kodiert,
+    um 400-Fehler (zu grosses Bild) und OOM zu vermeiden.
     """
     image_path = resolve_image_path(pdf_path, page_number)
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"Seitenbild nicht gefunden: {image_path}")
-    file_size = os.path.getsize(image_path)
-    size_mb = file_size / (1024 * 1024)
-    with open(image_path, "rb") as f:
-        image_bytes = f.read()
-    width, height = _png_dimensions(image_bytes)
-    return image_bytes, (width, height), size_mb
+    img = None
+    try:
+        if os.path.exists(image_path):
+            img = Image.open(image_path)
+            img.load()
+        elif RENDER_MISSING_IMAGES:
+            img = _render_pdf_page_image(pdf_path, page_number)
+            _persist_rendered_png(img, pdf_path, page_number)
+        else:
+            raise FileNotFoundError(f"Seitenbild nicht gefunden: {image_path}")
+
+        jpeg_bytes, dims = _downscale_to_jpeg(img)
+        size_mb = len(jpeg_bytes) / (1024 * 1024)
+        return jpeg_bytes, dims, size_mb
+    finally:
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
+            del img
 
 
 def _png_dimensions(data: bytes) -> Tuple[int, int]:
@@ -582,6 +670,33 @@ def count_page_images(pdf_path: str) -> int:
     if not image_dir.exists():
         return 0
     return len([f for f in image_dir.iterdir() if f.suffix.lower() == ".png" and "__seite_" in f.name])
+
+
+def count_pdf_pages(pdf_path: str) -> int:
+    """Seitenzahl direkt aus dem PDF (Fallback, wenn keine Bilder vorliegen)."""
+    if not _HAS_FITZ:
+        return 0
+    try:
+        doc = fitz.open(pdf_path)
+        n = doc.page_count
+        doc.close()
+        return n
+    except Exception:
+        return 0
+
+
+def get_page_count(pdf_path: str) -> int:
+    """Seitenzahl: vorrangig aus vorhandenen Volume-Bildern, sonst aus dem PDF.
+
+    So entstehen auch fuer Dokumente ohne vorgerenderte Bilder Manifest-Eintraege;
+    die Seiten werden dann beim Laden on-demand gerendert.
+    """
+    n = count_page_images(pdf_path)
+    if n > 0:
+        return n
+    if RENDER_MISSING_IMAGES:
+        return count_pdf_pages(pdf_path)
+    return 0
 
 
 def make_orientation_collage(pdf_path: str, page_number: int) -> bytes:
@@ -675,47 +790,71 @@ def response_text_from_serving_response(payload: Dict[str, Any]) -> str:
     return str(content)
 
 
+def _shrink_image_bytes(image_bytes: bytes, factor: float = 0.6) -> bytes:
+    """Verkleinert ein Bild um den Faktor und gibt JPEG-Bytes zurueck (Fallback bei 400)."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        new_size = (max(1, int(img.width * factor)), max(1, int(img.height * factor)))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        img.close()
+        return out.getvalue()
+    except Exception:
+        return image_bytes
+
+
+# Schluesselwoerter, die in einer 400-Antwort auf ein zu grosses Bild hindeuten.
+_IMAGE_SIZE_ERROR_HINTS = ("image", "pixel", "too large", "dimension", "exceeds", "max size", "größe", "groesse")
+_MAX_SHRINK_STEPS = 3
+
+
 def call_model_images(
     model_name: str,
     prompt: str,
     labelled_images: List[Tuple[str, bytes]],
     max_tokens: int = MAX_TOKENS,
     use_json_response_format: bool = True,
+    retries: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
-
-    for label, image_bytes in labelled_images:
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        mime = "image/png" if image_bytes[:8] == b'\x89PNG\r\n\x1a\n' else "image/jpeg"
-        content.append({"type": "text", "text": f"IMAGE_LABEL: {label}"})
-        content.append({
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:{mime};base64,{image_b64}",
-                "detail": "high",
-            },
-        })
-
-    request_payload: Dict[str, Any] = {
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": content},
-        ],
-        "stream": False,
-        "max_tokens": max_tokens,
-    }
+    images = list(labelled_images)
 
     # AI Gateway Route (OpenAI-kompatibel)
     url = f"{DB_HOST}/ai-gateway/mlflow/v1/chat/completions"
-    request_payload["model"] = model_name
     headers = {
         "Authorization": f"Bearer {DB_TOKEN}",
         "Content-Type": "application/json",
     }
 
+    n_retries = retries if retries and retries > 0 else MODEL_RETRIES
+    shrink_steps = 0
     last_error: Optional[Exception] = None
 
-    for attempt in range(1, MODEL_RETRIES + 1):
+    for attempt in range(1, n_retries + 1):
+        # Payload pro Versuch neu bauen, damit ein verkleinertes Bild wirkt.
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for label, image_bytes in images:
+            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            mime = "image/png" if image_bytes[:8] == b'\x89PNG\r\n\x1a\n' else "image/jpeg"
+            content.append({"type": "text", "text": f"IMAGE_LABEL: {label}"})
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{image_b64}", "detail": "high"},
+            })
+
+        request_payload: Dict[str, Any] = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            "stream": False,
+            "max_tokens": max_tokens,
+        }
+
         try:
             response = requests.post(
                 url,
@@ -724,23 +863,36 @@ def call_model_images(
                 timeout=REQUEST_TIMEOUT_S,
             )
 
-            if (
-                response.status_code == 400
-                and ("does not support" in response.text or "not supported" in response.text)
-            ):
-                # Unsupported parameter - retry without it
+            if response.status_code == 400:
                 error_text = response.text.lower()
-                if "temperature" in error_text:
-                    request_payload.pop("temperature", None)
+                # Unsupported parameter - entfernen und erneut (zaehlt nicht als Fehlversuch)
+                if "does not support" in error_text or "not supported" in error_text:
+                    if "temperature" in error_text:
+                        request_payload.pop("temperature", None)
+                        continue
+                    if "response_format" in error_text or "json_object" in error_text:
+                        request_payload.pop("response_format", None)
+                        continue
+                # Bild zu gross -> verkleinern und erneut versuchen
+                if (
+                    images
+                    and shrink_steps < _MAX_SHRINK_STEPS
+                    and any(h in error_text for h in _IMAGE_SIZE_ERROR_HINTS)
+                ):
+                    images = [(lbl, _shrink_image_bytes(b, 0.6)) for lbl, b in images]
+                    shrink_steps += 1
+                    last_error = RuntimeError(
+                        f"400 Bild zu gross, verkleinert (Schritt {shrink_steps}): {response.text[:300]}"
+                    )
                     continue
-                if "response_format" in error_text or "json_object" in error_text:
-                    request_payload.pop("response_format", None)
-                    continue
+                # Anderer 400 -> nicht retrybar; Schleife verlassen und an
+                # Aufrufer (Modell-Kaskade) durchreichen.
+                last_error = RuntimeError(f"400 (nicht retrybar) fuer {model_name}: {response.text[:1000]}")
+                break
 
             if response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
                 last_error = RuntimeError(f"{response.status_code}: {response.text[:1000]}")
-                sleep_s = min(90, 2 ** attempt)
-                time.sleep(sleep_s)
+                time.sleep(min(90, 2 ** attempt))
                 continue
 
             response.raise_for_status()
@@ -749,8 +901,7 @@ def call_model_images(
 
         except Exception as exc:
             last_error = exc
-            sleep_s = min(90, 2 ** attempt)
-            time.sleep(sleep_s)
+            time.sleep(min(30, 2 ** attempt))
 
     raise RuntimeError(f"Model call endgueltig fehlgeschlagen fuer {model_name}: {last_error}")
 
@@ -777,7 +928,24 @@ def select_available_vision_model() -> str:
     raise RuntimeError("Keines der konfigurierten Modelle ist als Vision-Modell nutzbar.")
 
 
-SELECTED_MODEL = select_available_vision_model()
+if FORCE_MODEL:
+    SELECTED_MODEL = FORCE_MODEL
+    print(f"FORCE_MODEL gesetzt -> nutze ausschliesslich: {SELECTED_MODEL}")
+else:
+    SELECTED_MODEL = select_available_vision_model()
+
+# Modell-Reihenfolge pro Seite. Ohne FORCE_MODEL wird IMMER zuerst das
+# Wunschmodell (Opus) versucht und nur bei echtem Fehler auf den Fallback
+# gewechselt. So legt ein einmal flaky Verfuegbarkeits-Test den ganzen Run nicht
+# auf den schwaecheren Fallback fest.
+if FORCE_MODEL:
+    MODEL_CASCADE = [FORCE_MODEL]
+else:
+    MODEL_CASCADE = []
+    for _m in [PRIMARY_MODEL, SELECTED_MODEL, FALLBACK_MODEL]:
+        if _m and _m not in MODEL_CASCADE:
+            MODEL_CASCADE.append(_m)
+print(f"MODEL_CASCADE (Reihenfolge pro Seite): {MODEL_CASCADE}")
 
 # COMMAND ----------
 
@@ -1002,25 +1170,32 @@ def process_single_page_parallel(row: Dict[str, Any]) -> Dict[str, Any]:
             selected_rotation_degrees=rotation,
         )
 
-        try:
-            response_text, _ = call_model_images(
-                model_name=SELECTED_MODEL,
-                prompt=prompt,
-                labelled_images=labelled_images,
-                max_tokens=MAX_TOKENS,
-            )
-            model_used = SELECTED_MODEL
-        except Exception as primary_exc:
-            if SELECTED_MODEL != FALLBACK_MODEL:
+        # Modell-Kaskade: zuerst Wunschmodell (Opus), dann Fallback. Die nicht
+        # letzten Modelle erhalten ein kleines Retry-Budget, damit bei echtem
+        # Ausfall schnell auf den Fallback gewechselt wird; das letzte Modell
+        # nutzt das volle Budget.
+        response_text = None
+        last_model_exc: Optional[Exception] = None
+        n_models = len(MODEL_CASCADE)
+        for ci, _m in enumerate(MODEL_CASCADE):
+            is_last = ci == n_models - 1
+            try:
                 response_text, _ = call_model_images(
-                    model_name=FALLBACK_MODEL,
+                    model_name=_m,
                     prompt=prompt,
                     labelled_images=labelled_images,
                     max_tokens=MAX_TOKENS,
+                    retries=None if is_last else 3,
                 )
-                model_used = FALLBACK_MODEL
-            else:
-                raise primary_exc
+                model_used = _m
+                last_model_exc = None
+                break
+            except Exception as model_exc:
+                last_model_exc = model_exc
+                continue
+
+        if response_text is None:
+            raise last_model_exc if last_model_exc else RuntimeError("Kein Modell lieferte eine Antwort.")
 
         parsed = extract_json_from_model_text(response_text)
 
@@ -1154,9 +1329,11 @@ for pdf_path in pdf_paths:
     document_id = sha1_short(pdf_path, 20)
 
     try:
-        page_count = count_page_images(pdf_path)
+        page_count = get_page_count(pdf_path)
         if page_count == 0:
-            raise FileNotFoundError(f"Keine Seitenbilder fuer: {pdf_path}")
+            raise FileNotFoundError(
+                f"Keine Seitenbilder und keine lesbaren PDF-Seiten fuer: {pdf_path}"
+            )
 
         for page_number in range(1, page_count + 1):
             page_id = f"{document_id}_p{page_number:04d}"

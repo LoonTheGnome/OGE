@@ -81,6 +81,15 @@ Weitere Widgets:
 
 Hinweis: Bei einem Restart desselben Laufs gelten nur Seiten mit `status='ok'` als erledigt; Fehlerseiten werden automatisch erneut versucht.
 
+## Modellwahl und fehlende Bilder
+
+Weitere Widgets:
+
+- `FORCE_MODEL` — wenn gesetzt (z. B. `databricks-claude-opus-4-8`), wird **ausschliesslich** dieses Modell genutzt, kein Fallback. Leer = Kaskade: pro Seite zuerst Opus, nur bei echtem Fehler Sonnet. Ein einmal flaky Verfuegbarkeits-Test legt den Lauf damit nicht mehr dauerhaft auf den Fallback fest.
+- `RENDER_MISSING_IMAGES` (`true`/`false`) — fehlt ein vorgerendertes Seitenbild im Volume, wird die Seite bei Bedarf aus dem PDF gerendert (PyMuPDF) und als PNG ins Volume geschrieben, sodass Folgelaeufe es als Cache finden.
+
+Robustheit gegen `400 Bad Request` (zu grosse Bilder): Seitenbilder werden vor dem Senden auf `MAX_IMAGE_SIDE_PX` herunterskaliert und als JPEG kodiert; bei einem groessenbedingten 400 verkleinert der Aufruf das Bild zusaetzlich und versucht es erneut.
+
 ## Tuning
 
 Startwerte:
