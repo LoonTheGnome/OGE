@@ -517,11 +517,21 @@ def stable_key_from_dp(
     return sha1_short(safe_json(payload), 32)
 
 
-def calculate_preverification_confidence(dp: Dict[str, Any], page_quality: Dict[str, Any]) -> Tuple[float, float, bool]:
-    base = clamp_confidence(dp.get("confidence_model", dp.get("confidence")), default=0.55)
+def calculate_preverification_confidence(
+    dp: Dict[str, Any],
+    ids: List[Dict[str, Any]],
+    page_quality: Dict[str, Any],
+) -> Tuple[float, float, bool]:
+    base = clamp_confidence(
+        dp.get("conf", dp.get("confidence_model", dp.get("confidence"))),
+        default=0.55,
+    )
     adjustment = 0.0
 
-    ids = dp.get("identifiers", []) or []
+    # ids wird vom Aufrufer bereits aus dem kompakten Format (dp["ids"]) aufgeloest
+    # und uebergeben. Frueher wurde hier faelschlich dp["identifiers"] gelesen, das
+    # im kompakten Modell-Output nie existiert -> jeder Wert bekam den -0.20-Abzug.
+    ids = ids or []
     if not ids:
         adjustment -= 0.20
 
@@ -531,8 +541,9 @@ def calculate_preverification_confidence(dp: Dict[str, Any], page_quality: Dict[
     if "inferred_from_previous_page" in scopes:
         adjustment -= 0.07
 
-    scan_quality = normalise_text(page_quality.get("scan_quality"))
-    if scan_quality == "poor":
+    # page_info nutzt den Key "quality" (good|medium|poor); aeltere Formate "scan_quality".
+    scan_quality = normalise_text(page_quality.get("quality", page_quality.get("scan_quality")))
+    if scan_quality in ("poor", "bad"):
         adjustment -= 0.15
     elif scan_quality == "unreadable":
         adjustment -= 0.35
@@ -1689,7 +1700,7 @@ def flatten_datapoints_from_parsed(
                 slot_parts.append(str(specimen))
             value_slot_key = ":".join(p for p in slot_parts if p)
 
-        confidence_model, rule_adjustment, needs_review = calculate_preverification_confidence(dp, page_quality)
+        confidence_model, rule_adjustment, needs_review = calculate_preverification_confidence(dp, ids, page_quality)
         # Override confidence from model response if present
         if conf is not None:
             confidence_model = clamp_confidence(conf, default=0.5)
