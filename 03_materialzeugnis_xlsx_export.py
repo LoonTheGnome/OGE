@@ -246,7 +246,6 @@ def make_wide_sheet(df: pd.DataFrame) -> pd.DataFrame:
                 columns="property_name",
                 values="value_raw",
                 aggfunc=lambda x: " | ".join([str(v) for v in x if pd.notna(v)]),
-                dropna=False,
             )
             .reset_index()
         )

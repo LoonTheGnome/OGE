@@ -82,6 +82,10 @@ PAGESTATUS_COLS = ["page_id", "page_number", "file_name", "status", "run_id",
 FULL_SUBDIR = "mit_run_info"
 CLEAN_SUBDIR = "ohne_run_info"
 
+# Harte Excel-Grenzen (Schutz, damit nichts crasht, sondern hoechstens gekuerzt wird)
+EXCEL_MAX_ROWS = 1_048_576
+EXCEL_MAX_COLS = 16_384
+
 
 # ------------------------------------------------------------------
 # Hilfsfunktionen
@@ -130,9 +134,12 @@ def make_wide_sheet(df: pd.DataFrame) -> pd.DataFrame:
     tmp = df.copy()
     tmp["property_name"] = tmp["property_name"].fillna("unknown_property").astype(str)
     try:
+        # WICHTIG: KEIN dropna=False - das erzeugt bei MultiIndex das kartesische
+        # Produkt aller Index-Werte (Millionen Zeilen). Default haelt nur die
+        # tatsaechlich vorkommenden Kombinationen.
         wide = tmp.pivot_table(
             index=index_cols, columns="property_name", values="value_raw",
-            aggfunc=lambda x: " | ".join([str(v) for v in x if pd.notna(v)]), dropna=False,
+            aggfunc=lambda x: " | ".join([str(v) for v in x if pd.notna(v)]),
         ).reset_index()
         wide.columns = [str(c) for c in wide.columns]
         return wide
@@ -159,6 +166,13 @@ def write_xlsx(sheets, target_path: Path) -> None:
         for raw_name, df in sheets:
             name = safe_sheet_name(raw_name, used)
             frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+            # Excel-Grenzen absichern (sollte nach dem dropna-Fix nie greifen)
+            if frame.shape[0] > EXCEL_MAX_ROWS - 1:
+                print(f"    WARNUNG: Sheet '{raw_name}' {frame.shape[0]} Zeilen > Excel-Limit -> gekuerzt.", flush=True)
+                frame = frame.iloc[: EXCEL_MAX_ROWS - 1]
+            if frame.shape[1] > EXCEL_MAX_COLS:
+                print(f"    WARNUNG: Sheet '{raw_name}' {frame.shape[1]} Spalten > Excel-Limit -> gekuerzt.", flush=True)
+                frame = frame.iloc[:, :EXCEL_MAX_COLS]
             _clean_for_excel(frame).to_excel(writer, sheet_name=name, index=False, freeze_panes=(1, 0))
             ws = writer.sheets[name]
             n_rows, n_cols = frame.shape
