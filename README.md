@@ -21,6 +21,17 @@ Dieses Paket enthaelt ein Databricks-Notebook im Source-Format zur parallelen Au
   Daten korrigieren, ohne erneut zu extrahieren. Quelle der Wahrheit ist
   `materialzeugnisse_raw_page_extractions.parsed_json` (wird nur gelesen).
 
+- `05_materialzeugnis_parquet_export.py` + `local_xlsx_converter.py`  
+  **Empfohlener, OOM-sicherer Weg fuer die xlsx-Erzeugung.** Das Notebook schreibt
+  die konsolidierten Tabellen verteilt als Parquet ins Volume (Spark `write`, kein
+  Treiber-Speicher -> kann nicht OOMen). Die eigentlichen Excel-Dateien (zwei
+  Versionen pro Dokument, nummerierte Ordner, alle Sheets) erzeugt man danach
+  **lokal** mit `local_xlsx_converter.py` (Laptop/VS Code, `pip install pandas
+  pyarrow xlsxwriter`). Der lokale Lauf ist resumebar (ueberspringt vorhandene
+  Dateien). Hintergrund: xlsx fuer 20-31k-Zeilen-Dokumente auf einem kleinen
+  Serverless-Treiber zu bauen ist nicht zuverlaessig moeglich; Notebook 03 bleibt
+  als reiner Serverless-Versuch erhalten.
+
 - `GENIE_PROMPT.md`  
   Korrigierter Prompt fuer Databricks Genie / Databricks Assistant. Ziel ist nicht Q&A, sondern die Erzeugung eines Export-Notebooks.
 
