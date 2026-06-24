@@ -57,6 +57,14 @@ print(f"xlsxwriter Version: {xlsxwriter.__version__}", flush=True)
 CATALOG = "playground"
 SCHEMA = "u_daniel_bick"
 
+# Streaming-Tuning: weniger Shuffle-Partitionen -> deutlich weniger serielle
+# toLocalIterator-Round-Trips pro Sheet. Passend, weil die Dokumente hier
+# hoechstens ~31k Zeilen haben (eine Partition bleibt damit klein genug).
+try:
+    spark.conf.set("spark.sql.shuffle.partitions", "16")
+except Exception as _e:  # noqa
+    print(f"Hinweis: spark.sql.shuffle.partitions nicht setzbar: {_e}", flush=True)
+
 DEFAULT_XLSX_EXPORT_ROOT = "/Volumes/playground/u_daniel_bick/rohdaten/Projektdaten_Excel_Export/xlsx"
 CONFIDENCE_THRESHOLD_REVIEW = 0.70
 
@@ -390,7 +398,9 @@ def write_spark_sheet(wb, sheet_name: str, sdf, columns: List[str], used_names: 
     ws.write_row(0, 0, [str(c) for c in columns])
     ws.freeze_panes(1, 0)
     r = 1
-    for row in sdf.select(*columns).toLocalIterator():
+    # prefetchPartitions=True: naechste Partition wird geladen waehrend die aktuelle
+    # geschrieben wird -> schneller, haelt nur ~2 (kleine) Partitionen im Treiber.
+    for row in sdf.select(*columns).toLocalIterator(prefetchPartitions=True):
         ws.write_row(r, 0, [_coerce_cell(row[c]) for c in columns])
         r += 1
     if r > 1:
