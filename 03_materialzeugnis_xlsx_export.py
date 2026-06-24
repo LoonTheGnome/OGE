@@ -26,8 +26,11 @@
 # DBTITLE 1,Imports und Parameter
 from __future__ import annotations
 
-import io
+import gc
+import os
 import re
+import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -222,53 +225,54 @@ def make_wide_sheet(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def autosize_and_format(writer: pd.ExcelWriter) -> None:
-    """Freeze-Panes, AutoFilter und sinnvolle Spaltenbreiten je Sheet."""
-    from openpyxl.utils import get_column_letter
+def _light_format(writer: pd.ExcelWriter) -> None:
+    """Nur Header fixieren + AutoFilter setzen (beides O(1) je Sheet).
 
+    Bewusst KEIN Spaltenbreiten-Scan: das Iterieren ueber alle Zellen sprengt bei
+    grossen Sheets (30k+ Zeilen) auf Serverless den RAM.
+    """
     for ws in writer.book.worksheets:
         if ws.max_row < 1 or ws.max_column < 1:
             continue
-        # Header fixieren + Filter
         ws.freeze_panes = "A2"
         try:
             ws.auto_filter.ref = ws.dimensions
         except Exception:
             pass
-        # Spaltenbreiten anhand der ersten ~200 Zeilen schaetzen
-        for col_idx in range(1, ws.max_column + 1):
-            letter = get_column_letter(col_idx)
-            max_len = 0
-            for row_idx, cell in enumerate(ws[letter]):
-                if row_idx > 200:
-                    break
-                if cell.value is not None:
-                    max_len = max(max_len, len(str(cell.value)))
-            ws.column_dimensions[letter].width = min(60, max(10, max_len + 2))
 
 
 def write_volume_xlsx(sheets: List[tuple], target_path: str) -> None:
     """Schreibt mehrere DataFrames als Sheets in eine xlsx-Datei im Volume.
 
+    Speicherschonend: schreibt zuerst in eine lokale Temp-Datei (kein BytesIO, das
+    Arbeitsmappe und serialisierte Kopie gleichzeitig im RAM haelt) und kopiert die
+    fertige Datei danach ins Volume.
+
     sheets: Liste von (sheet_name, DataFrame). Leere DataFrames werden als leeres
     Sheet (nur ggf. Header) geschrieben, damit die Struktur konsistent bleibt.
     """
-    buffer = io.BytesIO()
     used_names: set = set()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        wrote_any = False
-        for raw_name, df in sheets:
-            name = safe_sheet_name(raw_name, used_names)
-            frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-            frame.to_excel(writer, sheet_name=name, index=False)
-            wrote_any = True
-        if not wrote_any:
-            pd.DataFrame().to_excel(writer, sheet_name="leer", index=False)
-        autosize_and_format(writer)
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    try:
+        with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+            wrote_any = False
+            for raw_name, df in sheets:
+                name = safe_sheet_name(raw_name, used_names)
+                frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+                frame.to_excel(writer, sheet_name=name, index=False)
+                wrote_any = True
+            if not wrote_any:
+                pd.DataFrame().to_excel(writer, sheet_name="leer", index=False)
+            _light_format(writer)
 
-    Path(target_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(target_path, "wb") as f:
-        f.write(buffer.getvalue())
+        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(tmp_path, target_path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 # COMMAND ----------
 
@@ -424,20 +428,25 @@ for doc in documents:
 
     try:
         frames = load_document_frames(document_id)
+        n_dp = int(len(frames["dp"]))
         write_volume_xlsx(build_sheets(frames, meta, include_run_info=True), full_path)
         write_volume_xlsx(build_sheets(frames, meta, include_run_info=False), clean_path)
 
         export_rows.append({
             "folder_number": folder_number,
             "file_name": file_name,
-            "datapoints": int(len(frames["dp"])),
+            "datapoints": n_dp,
             "full_xlsx": full_path,
             "clean_xlsx": clean_path,
         })
-        print(f"  OK [{folder_number}] {file_name} ({len(frames['dp'])} Datenpunkte)")
+        print(f"  OK [{folder_number}] {file_name} ({n_dp} Datenpunkte)")
     except Exception as exc:
         errors.append({"file_name": file_name, "error": repr(exc)})
         print(f"  FEHLER [{folder_number}] {file_name}: {repr(exc)}")
+    finally:
+        # Speicher zwischen Dokumenten freigeben (grosse pandas-Frames)
+        frames = None
+        gc.collect()
 
 print(f"\nFertig: {len(export_rows)} Dokumente exportiert, {len(errors)} Fehler.")
 print(f"Zielverzeichnis: {XLSX_EXPORT_ROOT}")
