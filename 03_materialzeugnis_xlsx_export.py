@@ -19,10 +19,7 @@
 # COMMAND ----------
 
 # MAGIC %pip install xlsxwriter --quiet
-# MAGIC # Bewusst KEIN dbutils.library.restartPython(): in einem Job-Kontext kann der
-# MAGIC # Restart dazu fuehren, dass nachfolgende Zellen nicht mehr ausgefuehrt werden
-# MAGIC # (Notebook meldet "SUCCESS", obwohl der Export nie lief). xlsxwriter ist
-# MAGIC # pure-Python und wird unten importiert; falls noetig mit Fallback-Install.
+# MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
 
@@ -34,6 +31,7 @@ import os
 import re
 import shutil
 import tempfile
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -42,12 +40,18 @@ import pandas as pd
 try:
     import xlsxwriter
 except ImportError:
+    # Fallback, falls der %pip-Install im laufenden Prozess noch nicht greift.
+    import importlib
     import subprocess
     import sys as _sys
     subprocess.check_call([_sys.executable, "-m", "pip", "install", "xlsxwriter", "--quiet"])
+    importlib.invalidate_caches()
     import xlsxwriter
 from pyspark.sql import Window
 from pyspark.sql import functions as F
+
+# Frueh und LAUT scheitern, wenn der xlsx-Writer fehlt - statt spaeter 53x kryptisch.
+print(f"xlsxwriter Version: {xlsxwriter.__version__}", flush=True)
 
 CATALOG = "playground"
 SCHEMA = "u_daniel_bick"
@@ -507,7 +511,12 @@ for idx, doc in enumerate(documents, start=1):
         print(f"[{idx}/{total_docs}] OK [{folder_number}] {file_name} ({n_dp} Datenpunkte)", flush=True)
     except Exception as exc:
         errors.append({"file_name": file_name, "error": repr(exc)})
-        print(f"[{idx}/{total_docs}] FEHLER [{folder_number}] {file_name}: {repr(exc)}", flush=True)
+        # Beim ERSTEN Fehler den vollen Traceback zeigen, damit die Ursache nicht
+        # in der Schleife verschluckt wird.
+        if len(errors) == 1:
+            print(f"[{idx}/{total_docs}] ERSTER FEHLER bei {file_name}:\n{traceback.format_exc()}", flush=True)
+        else:
+            print(f"[{idx}/{total_docs}] FEHLER [{folder_number}] {file_name}: {repr(exc)}", flush=True)
     finally:
         gc.collect()
 
@@ -516,9 +525,10 @@ print(f"Zielverzeichnis: {XLSX_EXPORT_ROOT}")
 
 # Kein stiller "Erfolg": wenn keine einzige Datei geschrieben wurde, hart fehlschlagen.
 if not export_rows:
+    first_error = errors[0]["error"] if errors else "unbekannt"
     raise RuntimeError(
         f"Es wurde KEINE xlsx geschrieben (von {total_docs} Dokumenten, {len(errors)} Fehler). "
-        f"Export gilt als fehlgeschlagen."
+        f"Erster Fehler: {first_error}"
     )
 
 # COMMAND ----------
