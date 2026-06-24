@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import xlsxwriter
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 
@@ -228,53 +229,56 @@ def make_wide_sheet(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def write_volume_xlsx(sheets, target_path: str) -> None:
-    """Schreibt mehrere DataFrames als Sheets in eine xlsx-Datei im Volume.
+def _coerce_cell(v: Any) -> Any:
+    """xlsxwriter-taugliche Zelle: None/komplexe Typen zu str/"" wandeln."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float, str)):
+        return v
+    return str(v)
 
-    Speicherschonend fuer Serverless:
-    - Engine xlsxwriter mit constant_memory=True -> jede Zeile wird sofort auf die
-      Platte geflusht, die Arbeitsmappe wird NICHT komplett im RAM gehalten
-      (openpyxl tat genau das und sprengte bei 30k+ Zeilen den Speicher).
-    - Schreibt in eine lokale Temp-Datei und kopiert sie danach ins Volume.
-    - Teil-Frames werden nach dem Schreiben sofort freigegeben.
 
-    sheets: Iterable von (sheet_name, DataFrame). Mit constant_memory muessen die
-    Zeilen je Sheet in Reihenfolge geschrieben werden - pandas.to_excel tut das.
-    """
-    used_names: set = set()
+def open_workbook(target_path: str):
+    """xlsxwriter-Workbook ueber lokale Temp-Datei (constant_memory streamt auf Disk)."""
     fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
     os.close(fd)
-    try:
-        with pd.ExcelWriter(
-            tmp_path,
-            engine="xlsxwriter",
-            engine_kwargs={"options": {"constant_memory": True}},
-        ) as writer:
-            wrote_any = False
-            for raw_name, df in sheets:
-                name = safe_sheet_name(raw_name, used_names)
-                frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-                # freeze_panes fixiert die Kopfzeile (kein Zellen-Scan noetig)
-                frame.to_excel(writer, sheet_name=name, index=False, freeze_panes=(1, 0))
-                try:
-                    n_rows, n_cols = frame.shape
-                    if n_rows > 0 and n_cols > 0:
-                        writer.sheets[name].autofilter(0, 0, n_rows, n_cols - 1)
-                except Exception:
-                    pass
-                wrote_any = True
-                del frame
-                gc.collect()
-            if not wrote_any:
-                pd.DataFrame().to_excel(writer, sheet_name="leer", index=False)
+    wb = xlsxwriter.Workbook(tmp_path, {"constant_memory": True, "in_memory": False})
+    return wb, tmp_path
 
-        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(tmp_path, target_path)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+
+def finalize_workbook(wb, tmp_path: str, target_path: str) -> None:
+    wb.close()
+    Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(tmp_path, target_path)
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+
+def write_sheet_rows(wb, sheet_name: str, header: List[str], row_iter, used_names: set) -> int:
+    """Schreibt ein Sheet zeilenweise aus einem Iterator (haelt nie das ganze Sheet im RAM)."""
+    name = safe_sheet_name(sheet_name, used_names)
+    ws = wb.add_worksheet(name)
+    ncols = len(header)
+    if header:
+        ws.write_row(0, 0, [str(h) for h in header])
+        ws.freeze_panes(1, 0)
+    r = 1
+    for vals in row_iter:
+        ws.write_row(r, 0, [_coerce_cell(x) for x in vals])
+        r += 1
+    if header and r > 1:
+        ws.autofilter(0, 0, r - 1, max(0, ncols - 1))
+    return r - 1
+
+
+def spark_row_iter(sdf, columns: List[str]):
+    """Streamt Zeilen einer Spark-DataFrame partitionsweise in den Treiber."""
+    for row in sdf.select(*columns).toLocalIterator():
+        yield [row[c] for c in columns]
 
 # COMMAND ----------
 
@@ -302,121 +306,140 @@ print(f"Zu exportierende Dokumente: {len(documents)}")
 # COMMAND ----------
 
 # DBTITLE 1,Export pro Dokument (full + clean)
-def load_document_frames(document_id: str) -> Dict[str, pd.DataFrame]:
-    """Laedt alle relevanten Daten eines Dokuments als pandas-DataFrames."""
-    dp = (
+def _overview_rows(meta, dp_total, review_n, ids_n, pages_n, models, run_ids, include_run_info):
+    rows = [
+        ["file_name", meta["file_name"]],
+        ["origin_folder_number", meta["origin_folder"]],
+        ["pdf_path", meta["pdf_path"]],
+        ["datapoints_total", dp_total],
+        ["review_rows", review_n],
+        ["identifier_rows", ids_n],
+        ["page_rows", pages_n],
+        ["export_created_at_utc", datetime.utcnow().isoformat()],
+        ["version", "full (mit Run-Infos)" if include_run_info else "clean (ohne Run-Infos)"],
+    ]
+    if include_run_info:
+        rows += [
+            ["document_id", meta["document_id"]],
+            ["model_names", ", ".join(map(str, models))],
+            ["seen_run_ids", " ; ".join(map(str, run_ids))],
+        ]
+    return rows
+
+
+def export_document(document_id: str, meta: Dict[str, Any], full_path: str, clean_path: str) -> int:
+    """Exportiert ein Dokument als zwei xlsx (full/clean), zeilenweise gestreamt.
+
+    Es wird NICHTS pro Dokument komplett nach pandas materialisiert: jede Zeile
+    fliesst per toLocalIterator (partitionsweise) direkt in xlsxwriter
+    (constant_memory). So bleibt der Treiber-RAM unabhaengig von der Dokumentgroesse.
+    """
+    # Datenpunkte (sortiert, gecached -> viele Sheets lesen denselben Cache)
+    dp_sdf = (
         spark.table(DATAPOINT_TABLE)
         .where(F.col("document_id") == document_id)
         .orderBy("page_number", "record_type", "identifier_keys", "property_name")
-        .toPandas()
+        .cache()
     )
+    dp_total = dp_sdf.count()  # materialisiert den Cache
 
-    ids = (
+    dp_cols_all = [c for c in PREFERRED_DP_COLS if c in dp_sdf.columns] + [c for c in dp_sdf.columns if c not in PREFERRED_DP_COLS]
+    dp_cols_clean = [c for c in dp_cols_all if c not in RUN_META_COLUMNS]
+
+    ids_sdf = (
         spark.table(IDENTIFIER_TABLE)
         .where(F.col("document_id") == document_id)
         .dropDuplicates(["page_number", "identifier_type", "identifier_value"])
         .orderBy("page_number", "identifier_type", "identifier_value")
-        .toPandas()
     )
+    ids_cols_all = list(ids_sdf.columns)
+    ids_cols_clean = [c for c in ids_cols_all if c not in IDENTIFIER_DROP_CLEAN]
 
+    # Seitenstatus: nur noetige Spalten VOR dem Window auswaehlen, damit die
+    # riesigen Textspalten (parsed_json/response_text) nicht durch den Shuffle laufen.
     page_w = Window.partitionBy("page_id").orderBy(
         F.when(F.col("status") == "ok", F.lit(1)).otherwise(F.lit(0)).desc(),
         F.col("created_at_utc").desc(),
     )
-    pages = (
+    pages_sdf = (
         spark.table(RAW_TABLE)
         .where(F.col("document_id") == document_id)
+        .select("page_id", "page_number", "file_name", "status", "run_id",
+                "model_name", "duration_s", "error_message", "created_at_utc")
         .withColumn("_rn", F.row_number().over(page_w))
         .where(F.col("_rn") == 1)
-        .drop("_rn")
-        .select("page_id", "page_number", "file_name", "status", "run_id",
-                "model_name", "duration_s", "error_message")
+        .drop("_rn", "created_at_utc")
         .orderBy("page_number")
-        .toPandas()
     )
-    return {"dp": dp, "ids": ids, "pages": pages}
+    pages_cols_all = ["page_id", "page_number", "file_name", "status", "run_id", "model_name", "duration_s", "error_message"]
+    pages_cols_clean = [c for c in pages_cols_all if c not in PAGESTATUS_DROP_CLEAN]
 
+    review_cond = (
+        (F.col("needs_human_review") == True)
+        | (F.coalesce(F.col("confidence_final"), F.lit(0.0)) < F.lit(CONFIDENCE_THRESHOLD_REVIEW))
+        | (F.col("verification_status") == "changed_or_conflicting")
+    )
+    review_sdf = dp_sdf.where(review_cond)
 
-def build_sheets(frames: Dict[str, pd.DataFrame], meta: Dict[str, Any], include_run_info: bool):
-    """Generator: liefert (sheet_name, DataFrame) lazy.
-
-    Lazy, damit jedes Teil-Frame erst beim Schreiben entsteht und danach (vom
-    Writer) sofort freigegeben werden kann - wichtig fuer den RAM bei grossen
-    Dokumenten.
-    """
-    dp = frames["dp"].copy()
-    ids = frames["ids"].copy()
-    pages = frames["pages"].copy()
-
-    dp_total = int(len(dp))
-
-    # Datenpunkte: alle Felder, ggf. Run-/Technik-Felder entfernen
-    if not include_run_info and not dp.empty:
-        dp = drop_columns(dp, RUN_META_COLUMNS)
-    dp = reorder_columns(dp, PREFERRED_DP_COLS)
-
-    # Review-Teilmenge
-    if not dp.empty:
-        needs_review = dp["needs_human_review"] == True if "needs_human_review" in dp.columns else False
-        low_conf = dp["confidence_final"].fillna(0.0) < CONFIDENCE_THRESHOLD_REVIEW if "confidence_final" in dp.columns else False
-        conflict = dp["verification_status"] == "changed_or_conflicting" if "verification_status" in dp.columns else False
-        review = dp[needs_review | low_conf | conflict].copy()
-    else:
-        review = pd.DataFrame()
-
-    # Identifier / Page-Status: clean-Version ohne Run-/ID-Spalten
-    if not include_run_info:
-        ids = drop_columns(ids, IDENTIFIER_DROP_CLEAN)
-        pages = drop_columns(pages, PAGESTATUS_DROP_CLEAN)
-
-    # Overview
-    overview_rows = [
-        {"field": "file_name", "value": meta["file_name"]},
-        {"field": "origin_folder_number", "value": meta["origin_folder"]},
-        {"field": "pdf_path", "value": meta["pdf_path"]},
-        {"field": "datapoints_total", "value": dp_total},
-        {"field": "review_rows", "value": int(len(review))},
-        {"field": "identifier_rows", "value": int(len(ids))},
-        {"field": "page_rows", "value": int(len(pages))},
-        {"field": "export_created_at_utc", "value": datetime.utcnow().isoformat()},
-        {"field": "version", "value": "full (mit Run-Infos)" if include_run_info else "clean (ohne Run-Infos)"},
-    ]
-    if include_run_info:
-        src = frames["dp"]
-        models = sorted({str(m) for m in src.get("model_name", pd.Series(dtype=str)).dropna().unique()}) if not src.empty else []
-        run_ids = sorted({str(r) for r in src.get("seen_run_ids", pd.Series(dtype=str)).dropna().unique()}) if not src.empty else []
-        overview_rows.extend([
-            {"field": "document_id", "value": meta["document_id"]},
-            {"field": "model_names", "value": ", ".join(models)},
-            {"field": "seen_run_ids", "value": " ; ".join(run_ids)},
-        ])
-
-    yield ("00_Overview", pd.DataFrame(overview_rows))
-    yield ("01_All_Datapoints", dp)
-    yield ("02_Review", review)
-    yield ("03_Identifiers", ids)
-    yield ("04_Page_Status", pages)
-
-    # Fachliche Sheets je record_type. Wide-Pivots nur fuer kleinere Dokumente
-    # (der Pivot verdoppelt kurzzeitig den RAM-Bedarf).
+    # Kennzahlen + Record-Types einmalig bestimmen (guenstig auf dem Cache)
+    review_n = review_sdf.count()
+    ids_n = ids_sdf.count()
+    pages_n = pages_sdf.count()
+    models = sorted({r[0] for r in dp_sdf.select("model_name").distinct().collect() if r[0] is not None})
+    run_ids = sorted({r[0] for r in dp_sdf.select("seen_run_ids").distinct().collect() if r[0] is not None})
+    present_record_types = {r[0] for r in dp_sdf.select("record_type").distinct().collect()}
     allow_wide = dp_total <= WIDE_MAX_DATAPOINTS
-    if not dp.empty and "record_type" in dp.columns:
-        for record_type, sheet_name in RECORD_SHEETS:
-            sub = dp[dp["record_type"] == record_type].copy()
-            if sub.empty:
-                continue
-            yield (sheet_name, sub)
-            if allow_wide and record_type in WIDE_RECORD_TYPES:
-                wide = make_wide_sheet(sub)
-                if not wide.empty:
-                    yield (f"{sheet_name}_Wide", wide)
+
+    try:
+        for include_run_info, target in ((True, full_path), (False, clean_path)):
+            dp_cols = dp_cols_all if include_run_info else dp_cols_clean
+            ids_cols = ids_cols_all if include_run_info else ids_cols_clean
+            pg_cols = pages_cols_all if include_run_info else pages_cols_clean
+
+            wb, tmp_path = open_workbook(target)
+            used: set = set()
+            try:
+                write_sheet_rows(wb, "00_Overview", ["field", "value"],
+                                 iter(_overview_rows(meta, dp_total, review_n, ids_n, pages_n, models, run_ids, include_run_info)),
+                                 used)
+                write_sheet_rows(wb, "01_All_Datapoints", dp_cols, spark_row_iter(dp_sdf, dp_cols), used)
+                write_sheet_rows(wb, "02_Review", dp_cols, spark_row_iter(review_sdf, dp_cols), used)
+                write_sheet_rows(wb, "03_Identifiers", ids_cols, spark_row_iter(ids_sdf, ids_cols), used)
+                write_sheet_rows(wb, "04_Page_Status", pg_cols, spark_row_iter(pages_sdf, pg_cols), used)
+
+                for record_type, sheet_name in RECORD_SHEETS:
+                    if record_type not in present_record_types:
+                        continue
+                    sub = dp_sdf.where(F.col("record_type") == record_type)
+                    write_sheet_rows(wb, sheet_name, dp_cols, spark_row_iter(sub, dp_cols), used)
+                    if allow_wide and record_type in WIDE_RECORD_TYPES:
+                        wide_df = make_wide_sheet(sub.toPandas())
+                        if not wide_df.empty:
+                            write_sheet_rows(
+                                wb, f"{sheet_name}_Wide", list(wide_df.columns),
+                                (list(t) for t in wide_df.itertuples(index=False, name=None)), used,
+                            )
+                finalize_workbook(wb, tmp_path, target)
+            except Exception:
+                try:
+                    wb.close()
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+                raise
+        return dp_total
+    finally:
+        dp_sdf.unpersist()
 
 
 
 export_rows = []
 errors = []
+total_docs = len(documents)
 
-for doc in documents:
+print(f"Starte Export von {total_docs} Dokumenten ...", flush=True)
+
+for idx, doc in enumerate(documents, start=1):
     document_id = doc["document_id"]
     pdf_path = doc["pdf_path"]
     file_name = doc["file_name"]
@@ -434,12 +457,9 @@ for doc in documents:
     full_path = str(Path(XLSX_EXPORT_ROOT) / FULL_SUBDIR / folder_number / f"{stem}.xlsx")
     clean_path = str(Path(XLSX_EXPORT_ROOT) / CLEAN_SUBDIR / folder_number / f"{stem}.xlsx")
 
+    print(f"[{idx}/{total_docs}] start [{folder_number}] {file_name} ...", flush=True)
     try:
-        frames = load_document_frames(document_id)
-        n_dp = int(len(frames["dp"]))
-        write_volume_xlsx(build_sheets(frames, meta, include_run_info=True), full_path)
-        write_volume_xlsx(build_sheets(frames, meta, include_run_info=False), clean_path)
-
+        n_dp = export_document(document_id, meta, full_path, clean_path)
         export_rows.append({
             "folder_number": folder_number,
             "file_name": file_name,
@@ -447,16 +467,14 @@ for doc in documents:
             "full_xlsx": full_path,
             "clean_xlsx": clean_path,
         })
-        print(f"  OK [{folder_number}] {file_name} ({n_dp} Datenpunkte)")
+        print(f"[{idx}/{total_docs}] OK [{folder_number}] {file_name} ({n_dp} Datenpunkte)", flush=True)
     except Exception as exc:
         errors.append({"file_name": file_name, "error": repr(exc)})
-        print(f"  FEHLER [{folder_number}] {file_name}: {repr(exc)}")
+        print(f"[{idx}/{total_docs}] FEHLER [{folder_number}] {file_name}: {repr(exc)}", flush=True)
     finally:
-        # Speicher zwischen Dokumenten freigeben (grosse pandas-Frames)
-        frames = None
         gc.collect()
 
-print(f"\nFertig: {len(export_rows)} Dokumente exportiert, {len(errors)} Fehler.")
+print(f"\nFertig: {len(export_rows)} Dokumente exportiert, {len(errors)} Fehler.", flush=True)
 print(f"Zielverzeichnis: {XLSX_EXPORT_ROOT}")
 
 # COMMAND ----------
@@ -464,8 +482,14 @@ print(f"Zielverzeichnis: {XLSX_EXPORT_ROOT}")
 # DBTITLE 1,Index-Datei
 if export_rows:
     index_df = pd.DataFrame(export_rows).sort_values(["folder_number", "file_name"])
-    write_volume_xlsx([("Index", index_df)], str(Path(XLSX_EXPORT_ROOT) / "00_INDEX.xlsx"))
-    print(f"Index: {Path(XLSX_EXPORT_ROOT) / '00_INDEX.xlsx'}")
+    index_path = str(Path(XLSX_EXPORT_ROOT) / "00_INDEX.xlsx")
+    wb, tmp_path = open_workbook(index_path)
+    write_sheet_rows(
+        wb, "Index", list(index_df.columns),
+        (list(t) for t in index_df.itertuples(index=False, name=None)), set(),
+    )
+    finalize_workbook(wb, tmp_path, index_path)
+    print(f"Index: {index_path}")
     try:
         display(spark.createDataFrame(index_df))
     except Exception:
