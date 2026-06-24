@@ -19,7 +19,10 @@
 # COMMAND ----------
 
 # MAGIC %pip install xlsxwriter --quiet
-# MAGIC dbutils.library.restartPython()
+# MAGIC # Bewusst KEIN dbutils.library.restartPython(): in einem Job-Kontext kann der
+# MAGIC # Restart dazu fuehren, dass nachfolgende Zellen nicht mehr ausgefuehrt werden
+# MAGIC # (Notebook meldet "SUCCESS", obwohl der Export nie lief). xlsxwriter ist
+# MAGIC # pure-Python und wird unten importiert; falls noetig mit Fallback-Install.
 
 # COMMAND ----------
 
@@ -36,7 +39,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-import xlsxwriter
+try:
+    import xlsxwriter
+except ImportError:
+    import subprocess
+    import sys as _sys
+    subprocess.check_call([_sys.executable, "-m", "pip", "install", "xlsxwriter", "--quiet"])
+    import xlsxwriter
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 
@@ -283,6 +292,21 @@ def spark_row_iter(sdf, columns: List[str]):
 # COMMAND ----------
 
 # DBTITLE 1,Dokumente bestimmen
+# Vorbedingung: die konsolidierte Tabelle muss existieren und Zeilen haben.
+if not spark.catalog.tableExists(DATAPOINT_TABLE):
+    raise RuntimeError(
+        f"Tabelle {DATAPOINT_TABLE} existiert nicht. Zuerst die Extraktion bzw. "
+        f"das Re-Flatten-Notebook (04) ausfuehren."
+    )
+
+dp_total_rows = spark.table(DATAPOINT_TABLE).count()
+print(f"Zeilen in {DATAPOINT_TABLE}: {dp_total_rows}", flush=True)
+if dp_total_rows == 0:
+    raise RuntimeError(
+        f"{DATAPOINT_TABLE} ist LEER. Vermutlich wurde das Re-Flatten (04) ohne "
+        f"OK-Seiten ausgefuehrt oder die Extraktion fehlt. Export abgebrochen."
+    )
+
 # Basis: konsolidierte Datenpunkte (dokumentweit, ueber alle Laeufe).
 docs_df = (
     spark.table(DATAPOINT_TABLE)
@@ -291,17 +315,30 @@ docs_df = (
 )
 
 # Optional auf einen Run einschraenken (Dokumente, die in dem Run verarbeitet wurden).
+# Wichtig: ein STALE RUN_ID-Widget darf den Export nicht still auf 0 Dokumente
+# reduzieren. Wenn der Filter nichts trifft, wird er ignoriert (alle Dokumente).
 if RUN_ID_FILTER:
+    print(f"RUN_ID-Filter aktiv: {RUN_ID_FILTER}", flush=True)
     run_docs = (
         spark.table(PAGE_MANIFEST_TABLE)
         .where(F.col("run_id") == RUN_ID_FILTER)
         .select("document_id")
         .distinct()
     )
-    docs_df = docs_df.join(run_docs, "document_id", "inner")
+    filtered = docs_df.join(run_docs, "document_id", "inner")
+    if filtered.limit(1).count() == 0:
+        print(
+            f"WARNUNG: RUN_ID-Filter '{RUN_ID_FILTER}' trifft keine Dokumente "
+            f"(stale Widget?). Filter wird ignoriert -> ALLE Dokumente exportiert.",
+            flush=True,
+        )
+    else:
+        docs_df = filtered
 
 documents = [r.asDict() for r in docs_df.orderBy("file_name").collect()]
-print(f"Zu exportierende Dokumente: {len(documents)}")
+print(f"Zu exportierende Dokumente: {len(documents)}", flush=True)
+if not documents:
+    raise RuntimeError("Keine Dokumente zu exportieren - Export abgebrochen (siehe Meldungen oben).")
 
 # COMMAND ----------
 
@@ -476,6 +513,13 @@ for idx, doc in enumerate(documents, start=1):
 
 print(f"\nFertig: {len(export_rows)} Dokumente exportiert, {len(errors)} Fehler.", flush=True)
 print(f"Zielverzeichnis: {XLSX_EXPORT_ROOT}")
+
+# Kein stiller "Erfolg": wenn keine einzige Datei geschrieben wurde, hart fehlschlagen.
+if not export_rows:
+    raise RuntimeError(
+        f"Es wurde KEINE xlsx geschrieben (von {total_docs} Dokumenten, {len(errors)} Fehler). "
+        f"Export gilt als fehlgeschlagen."
+    )
 
 # COMMAND ----------
 
