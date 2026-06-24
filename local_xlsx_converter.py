@@ -197,8 +197,11 @@ def _split_frame(df: pd.DataFrame, max_rows: int = EXCEL_MAX_DATA_ROWS):
 def write_xlsx(sheets, target_path: Path) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     used: set = set()
+    # WICHTIG: KEIN constant_memory! In Kombination mit pandas.to_excel (das
+    # spaltenweise schreibt) verwirft constant_memory fast alle Zeilen -> Dateien
+    # waren "fast leer". Lokal (genug RAM) ist der Normalmodus problemlos.
     with pd.ExcelWriter(target_path, engine="xlsxwriter",
-                        engine_kwargs={"options": {"constant_memory": True, "nan_inf_to_errors": True}}) as writer:
+                        engine_kwargs={"options": {"nan_inf_to_errors": True}}) as writer:
         wrote = False
         for raw_name, df in sheets:
             frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
