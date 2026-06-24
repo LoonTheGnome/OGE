@@ -318,8 +318,9 @@ def main():
     ap.add_argument("--input", required=True, help="Ordner mit datapoints/ identifiers/ page_status/ (Parquet).")
     ap.add_argument("--output", required=True, help="Zielordner fuer die xlsx-Baeume.")
     ap.add_argument("--overwrite", action="store_true", help="Vorhandene xlsx ueberschreiben (sonst ueberspringen).")
-    ap.add_argument("--workers", type=int, default=min((os.cpu_count() or 4), 8),
-                    help="Parallele Prozesse (Default: min(CPU-Kerne, 8); 1 = sequenziell).")
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2),
+                    help="Parallele Prozesse (Default: CPU-Kerne - 2; 1 = sequenziell). "
+                         "GPU/NPU werden nicht genutzt - xlsx ist reine CPU-Arbeit.")
     args = ap.parse_args()
 
     in_root = Path(args.input)
