@@ -24,7 +24,6 @@ Aufruf:
 from __future__ import annotations
 
 import argparse
-import math
 import re
 from pathlib import Path
 
@@ -142,12 +141,13 @@ def make_wide_sheet(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _clean_for_excel(df: pd.DataFrame) -> pd.DataFrame:
-    """NaN/NaT/Inf -> leere Zellen, damit der xlsx-Writer nicht stolpert."""
+    """NaN/NaT/None -> leere Zellen (versionsunabhaengig, ohne applymap).
+    Inf wird zusaetzlich ersetzt; der Writer hat als Netz nan_inf_to_errors=True.
+    """
     if df is None or df.empty:
         return df
-    return df.applymap(
-        lambda v: "" if (v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))) else v
-    )
+    out = df.where(pd.notna(df), "")
+    return out.replace([float("inf"), float("-inf")], "")
 
 
 def write_xlsx(sheets, target_path: Path) -> None:
