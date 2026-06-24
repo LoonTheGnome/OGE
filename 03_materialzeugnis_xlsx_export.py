@@ -18,7 +18,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install openpyxl --quiet
+# MAGIC %pip install xlsxwriter --quiet
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -138,6 +138,9 @@ RECORD_SHEETS = [
     ("other", "21_Other"),
 ]
 WIDE_RECORD_TYPES = {"chemical", "tensile", "impact", "hardness"}
+# Wide-Pivot-Sheets nur fuer Dokumente bis zu dieser Datenpunktzahl erzeugen
+# (der Pivot verdoppelt kurzzeitig den RAM-Bedarf).
+WIDE_MAX_DATAPOINTS = 8000
 
 # Spalten, die in der clean-Version je Sheet zusaetzlich entfernt werden.
 IDENTIFIER_DROP_CLEAN = {"run_id", "identifier_id", "document_id", "page_id", "created_at_utc"}
@@ -225,46 +228,45 @@ def make_wide_sheet(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _light_format(writer: pd.ExcelWriter) -> None:
-    """Nur Header fixieren + AutoFilter setzen (beides O(1) je Sheet).
-
-    Bewusst KEIN Spaltenbreiten-Scan: das Iterieren ueber alle Zellen sprengt bei
-    grossen Sheets (30k+ Zeilen) auf Serverless den RAM.
-    """
-    for ws in writer.book.worksheets:
-        if ws.max_row < 1 or ws.max_column < 1:
-            continue
-        ws.freeze_panes = "A2"
-        try:
-            ws.auto_filter.ref = ws.dimensions
-        except Exception:
-            pass
-
-
-def write_volume_xlsx(sheets: List[tuple], target_path: str) -> None:
+def write_volume_xlsx(sheets, target_path: str) -> None:
     """Schreibt mehrere DataFrames als Sheets in eine xlsx-Datei im Volume.
 
-    Speicherschonend: schreibt zuerst in eine lokale Temp-Datei (kein BytesIO, das
-    Arbeitsmappe und serialisierte Kopie gleichzeitig im RAM haelt) und kopiert die
-    fertige Datei danach ins Volume.
+    Speicherschonend fuer Serverless:
+    - Engine xlsxwriter mit constant_memory=True -> jede Zeile wird sofort auf die
+      Platte geflusht, die Arbeitsmappe wird NICHT komplett im RAM gehalten
+      (openpyxl tat genau das und sprengte bei 30k+ Zeilen den Speicher).
+    - Schreibt in eine lokale Temp-Datei und kopiert sie danach ins Volume.
+    - Teil-Frames werden nach dem Schreiben sofort freigegeben.
 
-    sheets: Liste von (sheet_name, DataFrame). Leere DataFrames werden als leeres
-    Sheet (nur ggf. Header) geschrieben, damit die Struktur konsistent bleibt.
+    sheets: Iterable von (sheet_name, DataFrame). Mit constant_memory muessen die
+    Zeilen je Sheet in Reihenfolge geschrieben werden - pandas.to_excel tut das.
     """
     used_names: set = set()
     fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
     os.close(fd)
     try:
-        with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+        with pd.ExcelWriter(
+            tmp_path,
+            engine="xlsxwriter",
+            engine_kwargs={"options": {"constant_memory": True}},
+        ) as writer:
             wrote_any = False
             for raw_name, df in sheets:
                 name = safe_sheet_name(raw_name, used_names)
                 frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-                frame.to_excel(writer, sheet_name=name, index=False)
+                # freeze_panes fixiert die Kopfzeile (kein Zellen-Scan noetig)
+                frame.to_excel(writer, sheet_name=name, index=False, freeze_panes=(1, 0))
+                try:
+                    n_rows, n_cols = frame.shape
+                    if n_rows > 0 and n_cols > 0:
+                        writer.sheets[name].autofilter(0, 0, n_rows, n_cols - 1)
+                except Exception:
+                    pass
                 wrote_any = True
+                del frame
+                gc.collect()
             if not wrote_any:
                 pd.DataFrame().to_excel(writer, sheet_name="leer", index=False)
-            _light_format(writer)
 
         Path(target_path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(tmp_path, target_path)
@@ -335,10 +337,18 @@ def load_document_frames(document_id: str) -> Dict[str, pd.DataFrame]:
     return {"dp": dp, "ids": ids, "pages": pages}
 
 
-def build_sheets(frames: Dict[str, pd.DataFrame], meta: Dict[str, Any], include_run_info: bool) -> List[tuple]:
+def build_sheets(frames: Dict[str, pd.DataFrame], meta: Dict[str, Any], include_run_info: bool):
+    """Generator: liefert (sheet_name, DataFrame) lazy.
+
+    Lazy, damit jedes Teil-Frame erst beim Schreiben entsteht und danach (vom
+    Writer) sofort freigegeben werden kann - wichtig fuer den RAM bei grossen
+    Dokumenten.
+    """
     dp = frames["dp"].copy()
     ids = frames["ids"].copy()
     pages = frames["pages"].copy()
+
+    dp_total = int(len(dp))
 
     # Datenpunkte: alle Felder, ggf. Run-/Technik-Felder entfernen
     if not include_run_info and not dp.empty:
@@ -364,7 +374,7 @@ def build_sheets(frames: Dict[str, pd.DataFrame], meta: Dict[str, Any], include_
         {"field": "file_name", "value": meta["file_name"]},
         {"field": "origin_folder_number", "value": meta["origin_folder"]},
         {"field": "pdf_path", "value": meta["pdf_path"]},
-        {"field": "datapoints_total", "value": int(len(frames["dp"]))},
+        {"field": "datapoints_total", "value": dp_total},
         {"field": "review_rows", "value": int(len(review))},
         {"field": "identifier_rows", "value": int(len(ids))},
         {"field": "page_rows", "value": int(len(pages))},
@@ -380,29 +390,27 @@ def build_sheets(frames: Dict[str, pd.DataFrame], meta: Dict[str, Any], include_
             {"field": "model_names", "value": ", ".join(models)},
             {"field": "seen_run_ids", "value": " ; ".join(run_ids)},
         ])
-    overview = pd.DataFrame(overview_rows)
 
-    sheets: List[tuple] = [
-        ("00_Overview", overview),
-        ("01_All_Datapoints", dp),
-        ("02_Review", review),
-        ("03_Identifiers", ids),
-        ("04_Page_Status", pages),
-    ]
+    yield ("00_Overview", pd.DataFrame(overview_rows))
+    yield ("01_All_Datapoints", dp)
+    yield ("02_Review", review)
+    yield ("03_Identifiers", ids)
+    yield ("04_Page_Status", pages)
 
-    # Fachliche Sheets je record_type
+    # Fachliche Sheets je record_type. Wide-Pivots nur fuer kleinere Dokumente
+    # (der Pivot verdoppelt kurzzeitig den RAM-Bedarf).
+    allow_wide = dp_total <= WIDE_MAX_DATAPOINTS
     if not dp.empty and "record_type" in dp.columns:
         for record_type, sheet_name in RECORD_SHEETS:
             sub = dp[dp["record_type"] == record_type].copy()
             if sub.empty:
                 continue
-            sheets.append((sheet_name, sub))
-            if record_type in WIDE_RECORD_TYPES:
+            yield (sheet_name, sub)
+            if allow_wide and record_type in WIDE_RECORD_TYPES:
                 wide = make_wide_sheet(sub)
                 if not wide.empty:
-                    sheets.append((f"{sheet_name}_Wide", wide))
+                    yield (f"{sheet_name}_Wide", wide)
 
-    return sheets
 
 
 export_rows = []
