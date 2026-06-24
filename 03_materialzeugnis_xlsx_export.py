@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import os
 import re
 import shutil
@@ -243,12 +244,19 @@ def make_wide_sheet(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _coerce_cell(v: Any) -> Any:
-    """xlsxwriter-taugliche Zelle: None/komplexe Typen zu str/"" wandeln."""
+    """xlsxwriter-taugliche Zelle: None/NaN/NaT/Inf -> "", komplexe Typen -> str."""
     if v is None:
         return ""
+    try:
+        if pd.isna(v):  # faengt NaN, NaT, pd.NA (Skalare)
+            return ""
+    except (TypeError, ValueError):
+        pass
     if isinstance(v, bool):
         return v
-    if isinstance(v, (int, float, str)):
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return ""
         return v
     return str(v)
 
@@ -257,7 +265,11 @@ def open_workbook(target_path: str):
     """xlsxwriter-Workbook ueber lokale Temp-Datei (constant_memory streamt auf Disk)."""
     fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
     os.close(fd)
-    wb = xlsxwriter.Workbook(tmp_path, {"constant_memory": True, "in_memory": False})
+    # nan_inf_to_errors als Sicherheitsnetz, falls doch ein NaN/Inf durchrutscht.
+    wb = xlsxwriter.Workbook(
+        tmp_path,
+        {"constant_memory": True, "in_memory": False, "nan_inf_to_errors": True},
+    )
     return wb, tmp_path
 
 
