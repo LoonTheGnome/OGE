@@ -154,8 +154,13 @@ RECORD_SHEETS = [
 ]
 WIDE_RECORD_TYPES = {"chemical", "tensile", "impact", "hardness"}
 # Wide-Pivot-Sheets nur fuer Dokumente bis zu dieser Datenpunktzahl erzeugen
-# (der Pivot verdoppelt kurzzeitig den RAM-Bedarf).
-WIDE_MAX_DATAPOINTS = 8000
+# (der Pivot benoetigt zusaetzlich pandas-Speicher).
+WIDE_MAX_DATAPOINTS = 5000
+# Fachliche Record-Type-Sheets nur fuer Dokumente bis zu dieser Groesse erzeugen.
+# Darueber wird nur das Kern-Set geschrieben (jede zusaetzliche Sheet-Variante
+# bedeutet einen weiteren Re-Scan des Dokuments). In 01_All_Datapoints kann ohnehin
+# nach record_type gefiltert werden.
+RECORD_SPLIT_MAX_DATAPOINTS = 8000
 
 # Spalten, die in der clean-Version je Sheet zusaetzlich entfernt werden.
 IDENTIFIER_DROP_CLEAN = {"run_id", "identifier_id", "document_id", "page_id", "created_at_utc"}
@@ -299,12 +304,6 @@ def write_sheet_rows(wb, sheet_name: str, header: List[str], row_iter, used_name
         ws.autofilter(0, 0, r - 1, max(0, ncols - 1))
     return r - 1
 
-
-def spark_row_iter(sdf, columns: List[str]):
-    """Streamt Zeilen einer Spark-DataFrame partitionsweise in den Treiber."""
-    for row in sdf.select(*columns).toLocalIterator():
-        yield [row[c] for c in columns]
-
 # COMMAND ----------
 
 # DBTITLE 1,Dokumente bestimmen
@@ -380,44 +379,58 @@ def _overview_rows(meta, dp_total, review_n, ids_n, pages_n, models, run_ids, in
     return rows
 
 
-def _pdf_rows(df, columns):
-    """Generator von Zeilen (Listen) aus einem pandas-DataFrame in Spaltenreihenfolge."""
-    cols = [c for c in columns if c in df.columns]
-    for t in df[cols].itertuples(index=False, name=None):
-        yield list(t)
+def write_spark_sheet(wb, sheet_name: str, sdf, columns: List[str], used_names: set) -> int:
+    """Schreibt ein Sheet, indem die Spark-Zeilen partitionsweise gestreamt werden.
+
+    Haelt nie mehr als eine Partition im Treiber -> Speicher unabhaengig von der
+    Dokumentgroesse (kein toPandas des ganzen Dokuments).
+    """
+    name = safe_sheet_name(sheet_name, used_names)
+    ws = wb.add_worksheet(name)
+    ws.write_row(0, 0, [str(c) for c in columns])
+    ws.freeze_panes(1, 0)
+    r = 1
+    for row in sdf.select(*columns).toLocalIterator():
+        ws.write_row(r, 0, [_coerce_cell(row[c]) for c in columns])
+        r += 1
+    if r > 1:
+        ws.autofilter(0, 0, r - 1, max(0, len(columns) - 1))
+    return r - 1
 
 
 def export_document(document_id: str, meta: Dict[str, Any], full_path: str, clean_path: str) -> int:
-    """Exportiert ein Dokument als zwei xlsx (full/clean).
+    """Exportiert ein Dokument als zwei xlsx (full/clean), Spark -> xlsxwriter gestreamt.
 
-    Serverless-konform: KEIN .cache()/.persist() (dort nicht erlaubt). Das Dokument
-    wird genau EINMAL nach pandas materialisiert (ein Spark-Job pro Tabelle), danach
-    werden alle Sheets aus diesem Frame geschrieben - keine wiederholten Queries.
-    xlsxwriter (constant_memory) haelt die Arbeitsmappe nicht im RAM; der Speicher
-    ist durch EIN Dokument begrenzt (das war nie die OOM-Ursache - das war openpyxl).
+    Serverless-konform und speicher-UNABHAENGIG von der Dokumentgroesse:
+    - KEIN .cache()/.persist() (auf Serverless verboten).
+    - KEIN toPandas() des ganzen Dokuments. Jede Zeile fliesst per toLocalIterator
+      (partitionsweise) direkt in xlsxwriter (constant_memory).
+    - Sehr grosse Dokumente: nur Kern-Sheets (Record-Split + Wide werden
+      uebersprungen), um die Zahl der Re-Scans und die Laufzeit zu begrenzen.
     """
-    dp = (
+    dp_sdf = (
         spark.table(DATAPOINT_TABLE)
         .where(F.col("document_id") == document_id)
         .orderBy("page_number", "record_type", "identifier_keys", "property_name")
-        .toPandas()
     )
-    dp_total = int(len(dp))
+    dp_cols_all = [c for c in PREFERRED_DP_COLS if c in dp_sdf.columns] + [c for c in dp_sdf.columns if c not in PREFERRED_DP_COLS]
+    dp_cols_clean = [c for c in dp_cols_all if c not in RUN_META_COLUMNS]
 
-    ids = (
+    ids_sdf = (
         spark.table(IDENTIFIER_TABLE)
         .where(F.col("document_id") == document_id)
         .dropDuplicates(["page_number", "identifier_type", "identifier_value"])
         .orderBy("page_number", "identifier_type", "identifier_value")
-        .toPandas()
     )
+    ids_cols_all = list(ids_sdf.columns)
+    ids_cols_clean = [c for c in ids_cols_all if c not in IDENTIFIER_DROP_CLEAN]
 
     # Seitenstatus: nur noetige Spalten VOR dem Window (kein parsed_json im Shuffle).
     page_w = Window.partitionBy("page_id").orderBy(
         F.when(F.col("status") == "ok", F.lit(1)).otherwise(F.lit(0)).desc(),
         F.col("created_at_utc").desc(),
     )
-    pages = (
+    pages_sdf = (
         spark.table(RAW_TABLE)
         .where(F.col("document_id") == document_id)
         .select("page_id", "page_number", "file_name", "status", "run_id",
@@ -426,75 +439,74 @@ def export_document(document_id: str, meta: Dict[str, Any], full_path: str, clea
         .where(F.col("_rn") == 1)
         .drop("_rn", "created_at_utc")
         .orderBy("page_number")
-        .toPandas()
     )
-
-    # Spaltenreihenfolgen
-    dp_cols_all = [c for c in PREFERRED_DP_COLS if c in dp.columns] + [c for c in dp.columns if c not in PREFERRED_DP_COLS]
-    dp_cols_clean = [c for c in dp_cols_all if c not in RUN_META_COLUMNS]
-    ids_cols_all = list(ids.columns)
-    ids_cols_clean = [c for c in ids_cols_all if c not in IDENTIFIER_DROP_CLEAN]
-    pages_cols_all = list(pages.columns)
+    pages_cols_all = ["page_id", "page_number", "file_name", "status", "run_id", "model_name", "duration_s", "error_message"]
     pages_cols_clean = [c for c in pages_cols_all if c not in PAGESTATUS_DROP_CLEAN]
 
-    # Review-Teilmenge (pandas)
-    if dp_total:
-        m_review = dp["needs_human_review"] == True if "needs_human_review" in dp.columns else pd.Series(False, index=dp.index)
-        m_low = dp["confidence_final"].fillna(0.0) < CONFIDENCE_THRESHOLD_REVIEW if "confidence_final" in dp.columns else pd.Series(False, index=dp.index)
-        m_conf = dp["verification_status"] == "changed_or_conflicting" if "verification_status" in dp.columns else pd.Series(False, index=dp.index)
-        review = dp[m_review | m_low | m_conf]
-    else:
-        review = dp.iloc[0:0]
+    review_sdf = dp_sdf.where(
+        (F.col("needs_human_review") == True)
+        | (F.coalesce(F.col("confidence_final"), F.lit(0.0)) < F.lit(CONFIDENCE_THRESHOLD_REVIEW))
+        | (F.col("verification_status") == "changed_or_conflicting")
+    )
 
-    review_n = int(len(review))
-    ids_n = int(len(ids))
-    pages_n = int(len(pages))
-    models = sorted({str(x) for x in dp["model_name"].dropna().unique()}) if ("model_name" in dp.columns and dp_total) else []
-    run_ids = sorted({str(x) for x in dp["seen_run_ids"].dropna().unique()}) if ("seen_run_ids" in dp.columns and dp_total) else []
-    present_record_types = set(dp["record_type"].dropna().unique()) if ("record_type" in dp.columns and dp_total) else set()
+    # Kennzahlen (kleine Jobs) + Verzweigung gross/klein
+    dp_total = dp_sdf.count()
+    review_n = review_sdf.count()
+    ids_n = ids_sdf.count()
+    pages_n = pages_sdf.count()
+    models = sorted({r[0] for r in dp_sdf.select("model_name").distinct().collect() if r[0] is not None})
+    run_ids = sorted({r[0] for r in dp_sdf.select("seen_run_ids").distinct().collect() if r[0] is not None})
+
+    do_splits = dp_total <= RECORD_SPLIT_MAX_DATAPOINTS
     allow_wide = dp_total <= WIDE_MAX_DATAPOINTS
+    if not do_splits:
+        print(
+            f"      Hinweis: {dp_total} Datenpunkte > {RECORD_SPLIT_MAX_DATAPOINTS} -> nur Kern-Sheets "
+            f"(Record-Split/Wide uebersprungen; in 01_All_Datapoints nach record_type filtern).",
+            flush=True,
+        )
+    present_record_types = (
+        {r[0] for r in dp_sdf.select("record_type").distinct().collect()} if do_splits else set()
+    )
 
-    try:
-        for include_run_info, target in ((True, full_path), (False, clean_path)):
-            dp_cols = dp_cols_all if include_run_info else dp_cols_clean
-            ids_cols = ids_cols_all if include_run_info else ids_cols_clean
-            pg_cols = pages_cols_all if include_run_info else pages_cols_clean
+    for include_run_info, target in ((True, full_path), (False, clean_path)):
+        dp_cols = dp_cols_all if include_run_info else dp_cols_clean
+        ids_cols = ids_cols_all if include_run_info else ids_cols_clean
+        pg_cols = pages_cols_all if include_run_info else pages_cols_clean
 
-            wb, tmp_path = open_workbook(target)
-            used: set = set()
+        wb, tmp_path = open_workbook(target)
+        used: set = set()
+        try:
+            write_sheet_rows(wb, "00_Overview", ["field", "value"],
+                             iter(_overview_rows(meta, dp_total, review_n, ids_n, pages_n, models, run_ids, include_run_info)),
+                             used)
+            write_spark_sheet(wb, "01_All_Datapoints", dp_sdf, dp_cols, used)
+            write_spark_sheet(wb, "02_Review", review_sdf, dp_cols, used)
+            write_spark_sheet(wb, "03_Identifiers", ids_sdf, ids_cols, used)
+            write_spark_sheet(wb, "04_Page_Status", pages_sdf, pg_cols, used)
+
+            for record_type, sheet_name in RECORD_SHEETS:
+                if record_type not in present_record_types:
+                    continue
+                sub = dp_sdf.where(F.col("record_type") == record_type)
+                write_spark_sheet(wb, sheet_name, sub, dp_cols, used)
+                if allow_wide and record_type in WIDE_RECORD_TYPES:
+                    wide_df = make_wide_sheet(sub.toPandas())  # nur kleine Dokumente
+                    if not wide_df.empty:
+                        write_sheet_rows(
+                            wb, f"{sheet_name}_Wide", list(wide_df.columns),
+                            (list(t) for t in wide_df.itertuples(index=False, name=None)), used,
+                        )
+            finalize_workbook(wb, tmp_path, target)
+        except Exception:
             try:
-                write_sheet_rows(wb, "00_Overview", ["field", "value"],
-                                 iter(_overview_rows(meta, dp_total, review_n, ids_n, pages_n, models, run_ids, include_run_info)),
-                                 used)
-                write_sheet_rows(wb, "01_All_Datapoints", dp_cols, _pdf_rows(dp, dp_cols), used)
-                write_sheet_rows(wb, "02_Review", dp_cols, _pdf_rows(review, dp_cols), used)
-                write_sheet_rows(wb, "03_Identifiers", ids_cols, _pdf_rows(ids, ids_cols), used)
-                write_sheet_rows(wb, "04_Page_Status", pg_cols, _pdf_rows(pages, pg_cols), used)
-
-                for record_type, sheet_name in RECORD_SHEETS:
-                    if record_type not in present_record_types:
-                        continue
-                    sub = dp[dp["record_type"] == record_type]
-                    write_sheet_rows(wb, sheet_name, dp_cols, _pdf_rows(sub, dp_cols), used)
-                    if allow_wide and record_type in WIDE_RECORD_TYPES:
-                        wide_df = make_wide_sheet(sub)
-                        if not wide_df.empty:
-                            write_sheet_rows(
-                                wb, f"{sheet_name}_Wide", list(wide_df.columns),
-                                (list(t) for t in wide_df.itertuples(index=False, name=None)), used,
-                            )
-                finalize_workbook(wb, tmp_path, target)
+                wb.close()
+                os.remove(tmp_path)
             except Exception:
-                try:
-                    wb.close()
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-                raise
-        return dp_total
-    finally:
-        del dp, ids, pages
-        gc.collect()
+                pass
+            raise
+
+    return dp_total
 
 
 
