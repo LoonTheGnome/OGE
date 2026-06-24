@@ -24,7 +24,9 @@ Aufruf:
 from __future__ import annotations
 
 import argparse
+import os
 import re
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 import pandas as pd
@@ -82,9 +84,10 @@ PAGESTATUS_COLS = ["page_id", "page_number", "file_name", "status", "run_id",
 FULL_SUBDIR = "mit_run_info"
 CLEAN_SUBDIR = "ohne_run_info"
 
-# Harte Excel-Grenzen (Schutz, damit nichts crasht, sondern hoechstens gekuerzt wird)
-EXCEL_MAX_ROWS = 1_048_576
-EXCEL_MAX_COLS = 16_384
+# Excel-Zeilenlimit pro Sheet inkl. Kopfzeile = 1.048.576 -> max. Datenzeilen.
+# Sheets mit mehr Zeilen werden AUTOMATISCH (verlustfrei) auf mehrere Sheets
+# aufgeteilt - bevorzugt an Seitengrenzen. Es wird NICHTS gekuerzt.
+EXCEL_MAX_DATA_ROWS = 1_048_575
 
 
 # ------------------------------------------------------------------
@@ -157,6 +160,40 @@ def _clean_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     return out.replace([float("inf"), float("-inf")], "")
 
 
+def _split_frame(df: pd.DataFrame, max_rows: int = EXCEL_MAX_DATA_ROWS):
+    """Teilt einen DataFrame verlustfrei in moeglichst WENIGE Teile <= max_rows.
+
+    Schneidet bevorzugt an Seitengrenzen (df ist nach page_number sortiert), sodass
+    keine Seite ueber zwei Sheets zerrissen wird. Jeder Teil wird maximal gefuellt.
+    Nur falls eine einzelne Seite > max_rows haette (praktisch nie: >1 Mio Zeilen),
+    wird hart geteilt - auch dann ohne Datenverlust.
+    """
+    n = len(df)
+    if n <= max_rows:
+        return [df]
+
+    if "page_number" in df.columns:
+        pages = df["page_number"].tolist()
+        boundaries = [0] + [i for i in range(1, n) if pages[i] != pages[i - 1]] + [n]
+    else:
+        boundaries = list(range(0, n, max_rows)) + [n]
+
+    parts = []
+    cur = 0
+    for b in range(1, len(boundaries)):
+        if boundaries[b] - cur > max_rows:
+            prev = boundaries[b - 1]
+            if prev > cur:
+                parts.append(df.iloc[cur:prev])
+                cur = prev
+            while boundaries[b] - cur > max_rows:  # Einzelseite groesser als Limit
+                parts.append(df.iloc[cur:cur + max_rows])
+                cur += max_rows
+    if cur < n:
+        parts.append(df.iloc[cur:n])
+    return parts
+
+
 def write_xlsx(sheets, target_path: Path) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     used: set = set()
@@ -164,21 +201,23 @@ def write_xlsx(sheets, target_path: Path) -> None:
                         engine_kwargs={"options": {"constant_memory": True, "nan_inf_to_errors": True}}) as writer:
         wrote = False
         for raw_name, df in sheets:
-            name = safe_sheet_name(raw_name, used)
             frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-            # Excel-Grenzen absichern (sollte nach dem dropna-Fix nie greifen)
-            if frame.shape[0] > EXCEL_MAX_ROWS - 1:
-                print(f"    WARNUNG: Sheet '{raw_name}' {frame.shape[0]} Zeilen > Excel-Limit -> gekuerzt.", flush=True)
-                frame = frame.iloc[: EXCEL_MAX_ROWS - 1]
-            if frame.shape[1] > EXCEL_MAX_COLS:
-                print(f"    WARNUNG: Sheet '{raw_name}' {frame.shape[1]} Spalten > Excel-Limit -> gekuerzt.", flush=True)
-                frame = frame.iloc[:, :EXCEL_MAX_COLS]
-            _clean_for_excel(frame).to_excel(writer, sheet_name=name, index=False, freeze_panes=(1, 0))
-            ws = writer.sheets[name]
-            n_rows, n_cols = frame.shape
-            if n_rows > 0 and n_cols > 0:
-                ws.autofilter(0, 0, n_rows, n_cols - 1)
-            wrote = True
+            # Verlustfrei: bei Ueberschreitung des Zeilenlimits auf mehrere SHEETS
+            # (in DERSELBEN Datei) aufteilen - es entstehen KEINE zusaetzlichen Dateien.
+            chunks = _split_frame(frame, EXCEL_MAX_DATA_ROWS)
+            multi = len(chunks) > 1
+            for ci, chunk in enumerate(chunks, start=1):
+                sub_name = f"{raw_name}_{ci}" if multi else raw_name
+                name = safe_sheet_name(sub_name, used)
+                _clean_for_excel(chunk).to_excel(writer, sheet_name=name, index=False, freeze_panes=(1, 0))
+                ws = writer.sheets[name]
+                n_rows, n_cols = chunk.shape
+                if n_rows > 0 and n_cols > 0:
+                    ws.autofilter(0, 0, n_rows, n_cols - 1)
+                wrote = True
+            if multi:
+                print(f"    Hinweis: '{raw_name}' auf {len(chunks)} Sheets aufgeteilt "
+                      f"(Excel-Zeilenlimit; verlustfrei, an Seitengrenzen).", flush=True)
         if not wrote:
             pd.DataFrame().to_excel(writer, sheet_name="leer", index=False)
 
@@ -245,11 +284,42 @@ def build_sheets(dp_doc, ids_doc, pages_doc, meta, include_run_info):
     return sheets
 
 
+def _slice_doc(dp_all, ids_all, pages_all, document_id):
+    """Schneidet die drei Frames auf ein Dokument zu (im Hauptprozess)."""
+    dp_doc = dp_all[dp_all["document_id"] == document_id].sort_values(
+        [c for c in ["page_number", "record_type", "identifier_keys", "property_name"] if c in dp_all.columns]
+    )
+    if "document_id" in ids_all.columns:
+        ids_doc = ids_all[ids_all["document_id"] == document_id]
+        if not ids_doc.empty:
+            ids_doc = ids_doc.sort_values([c for c in ["page_number", "identifier_type", "identifier_value"] if c in ids_doc.columns])
+    else:
+        ids_doc = ids_all.iloc[0:0]
+    if "document_id" in pages_all.columns:
+        pages_doc = pages_all[pages_all["document_id"] == document_id]
+    else:
+        pages_doc = pages_all.iloc[0:0]
+    if not pages_doc.empty and "page_number" in pages_doc.columns:
+        pages_doc = pages_doc.sort_values("page_number")
+    pages_doc = pages_doc[[c for c in PAGESTATUS_COLS if c in pages_doc.columns]]
+    return dp_doc, ids_doc, pages_doc
+
+
+def build_and_write(meta, dp_doc, ids_doc, pages_doc, full_path, clean_path):
+    """Erzeugt beide xlsx-Versionen fuer EIN Dokument. Modul-Ebene -> picklebar
+    fuer ProcessPoolExecutor."""
+    write_xlsx(build_sheets(dp_doc, ids_doc, pages_doc, meta, True), Path(full_path))
+    write_xlsx(build_sheets(dp_doc, ids_doc, pages_doc, meta, False), Path(clean_path))
+    return int(len(dp_doc))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Parquet -> zwei xlsx pro Dokument (lokal).")
     ap.add_argument("--input", required=True, help="Ordner mit datapoints/ identifiers/ page_status/ (Parquet).")
     ap.add_argument("--output", required=True, help="Zielordner fuer die xlsx-Baeume.")
     ap.add_argument("--overwrite", action="store_true", help="Vorhandene xlsx ueberschreiben (sonst ueberspringen).")
+    ap.add_argument("--workers", type=int, default=min((os.cpu_count() or 4), 8),
+                    help="Parallele Prozesse (Default: min(CPU-Kerne, 8); 1 = sequenziell).")
     args = ap.parse_args()
 
     in_root = Path(args.input)
@@ -261,7 +331,6 @@ def main():
     pages_all = pd.read_parquet(in_root / "page_status")
     print(f"  datapoints: {len(dp_all)} Zeilen, identifiers: {len(ids_all)}, page_status: {len(pages_all)}", flush=True)
 
-    # page_status auf die Anzeige-Spalten reduzieren (falls vorhanden)
     pages_cols = [c for c in PAGESTATUS_COLS if c in pages_all.columns]
     pages_all = pages_all[pages_cols + [c for c in ["document_id"] if c in pages_all.columns]]
 
@@ -272,43 +341,70 @@ def main():
         .to_dict("records")
     )
     total = len(docs)
-    print(f"Dokumente: {total}", flush=True)
 
-    done, skipped, errors = 0, 0, []
-    for i, doc in enumerate(docs, start=1):
+    # Aufgaben vorbereiten und bereits vorhandene (resume) ueberspringen.
+    tasks = []  # (meta, full_path, clean_path)
+    skipped = 0
+    for doc in docs:
         document_id = doc["document_id"]
         folder_number = origin_folder_number(doc["pdf_path"])
         stem = sanitize_name(Path(str(doc["file_name"])).stem) or str(document_id)
-        meta = {"document_id": document_id, "pdf_path": doc["pdf_path"],
-                "file_name": doc["file_name"], "origin_folder": folder_number}
-
         full_path = out_root / FULL_SUBDIR / folder_number / f"{stem}.xlsx"
         clean_path = out_root / CLEAN_SUBDIR / folder_number / f"{stem}.xlsx"
-
         if not args.overwrite and full_path.exists() and clean_path.exists():
             skipped += 1
-            print(f"[{i}/{total}] skip (vorhanden) [{folder_number}] {doc['file_name']}", flush=True)
             continue
+        meta = {"document_id": document_id, "pdf_path": doc["pdf_path"],
+                "file_name": doc["file_name"], "origin_folder": folder_number}
+        tasks.append((meta, full_path, clean_path))
 
+    workers = max(1, args.workers)
+    print(f"Dokumente: {total} | zu erzeugen: {len(tasks)} | uebersprungen: {skipped} | Workers: {workers}", flush=True)
+
+    done, errors = 0, []
+
+    def handle_result(meta, fut):
+        nonlocal done
         try:
-            dp_doc = dp_all[dp_all["document_id"] == document_id].sort_values(
-                [c for c in ["page_number", "record_type", "identifier_keys", "property_name"] if c in dp_all.columns]
-            )
-            ids_doc = ids_all[ids_all["document_id"] == document_id] if "document_id" in ids_all.columns else ids_all.iloc[0:0]
-            if not ids_doc.empty:
-                ids_doc = ids_doc.sort_values([c for c in ["page_number", "identifier_type", "identifier_value"] if c in ids_doc.columns])
-            pages_doc = pages_all[pages_all["document_id"] == document_id] if "document_id" in pages_all.columns else pages_all.iloc[0:0]
-            if not pages_doc.empty and "page_number" in pages_doc.columns:
-                pages_doc = pages_doc.sort_values("page_number")
-            pages_doc = pages_doc[[c for c in PAGESTATUS_COLS if c in pages_doc.columns]]
-
-            write_xlsx(build_sheets(dp_doc, ids_doc, pages_doc, meta, True), full_path)
-            write_xlsx(build_sheets(dp_doc, ids_doc, pages_doc, meta, False), clean_path)
+            n = fut.result()
             done += 1
-            print(f"[{i}/{total}] OK [{folder_number}] {doc['file_name']} ({len(dp_doc)} DP)", flush=True)
+            print(f"OK [{meta['origin_folder']}] {meta['file_name']} ({n} DP)", flush=True)
         except Exception as exc:
-            errors.append((doc["file_name"], repr(exc)))
-            print(f"[{i}/{total}] FEHLER [{folder_number}] {doc['file_name']}: {repr(exc)}", flush=True)
+            errors.append((meta["file_name"], repr(exc)))
+            print(f"FEHLER [{meta['origin_folder']}] {meta['file_name']}: {repr(exc)}", flush=True)
+
+    if workers == 1:
+        for meta, fp, cp in tasks:
+            try:
+                n = build_and_write(meta, *_slice_doc(dp_all, ids_all, pages_all, meta["document_id"]), fp, cp)
+                done += 1
+                print(f"OK [{meta['origin_folder']}] {meta['file_name']} ({n} DP)", flush=True)
+            except Exception as exc:
+                errors.append((meta["file_name"], repr(exc)))
+                print(f"FEHLER [{meta['origin_folder']}] {meta['file_name']}: {repr(exc)}", flush=True)
+    else:
+        # Bounded submission: nie mehr als ~2*workers Slices gleichzeitig im Speicher.
+        it = iter(tasks)
+        meta_by_future = {}
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            def submit_next():
+                try:
+                    meta, fp, cp = next(it)
+                except StopIteration:
+                    return False
+                dp_doc, ids_doc, pages_doc = _slice_doc(dp_all, ids_all, pages_all, meta["document_id"])
+                fut = ex.submit(build_and_write, meta, dp_doc, ids_doc, pages_doc, str(fp), str(cp))
+                meta_by_future[fut] = meta
+                return True
+
+            for _ in range(workers * 2):
+                if not submit_next():
+                    break
+            while meta_by_future:
+                finished, _pending = wait(set(meta_by_future), return_when=FIRST_COMPLETED)
+                for fut in finished:
+                    handle_result(meta_by_future.pop(fut), fut)
+                    submit_next()
 
     print(f"\nFertig: {done} erzeugt, {skipped} uebersprungen, {len(errors)} Fehler.")
     if errors:
